@@ -36,6 +36,21 @@ function normalizeWorkerId(value) {
   return cleanText(value).toUpperCase();
 }
 
+function toHalfWidth(input) {
+  return String(input).replace(/[０-９]/g, (char) =>
+    String("０１２３４５６７８９".indexOf(char)),
+  );
+}
+
+function normalizeInputText(text) {
+  return toHalfWidth(text)
+    .replace(/[／]/g, "/")
+    .replace(/[．。]/g, ".")
+    .replace(/[，、；;]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function nowText(timeZone) {
   return new Intl.DateTimeFormat("zh-TW", {
     timeZone,
@@ -47,10 +62,6 @@ function nowText(timeZone) {
     second: "2-digit",
     hour12: false,
   }).format(new Date());
-}
-
-function multiLang({ zh, en, vi }) {
-  return [`中文：${zh}`, `English: ${en}`, `Tiếng Việt: ${vi}`].join("\n");
 }
 
 function getGroupId(source) {
@@ -72,10 +83,6 @@ function statusText(status) {
 function extractWorkerId(text, config) {
   const match = cleanText(text).match(config.rules.workerIdPattern);
   return match ? normalizeWorkerId(match[0]) : null;
-}
-
-function dateInputHasMonth(text) {
-  return /(\d)\s*(\/|-|\.|月)/.test(cleanText(text));
 }
 
 function uniqueBy(items, keyFn) {
@@ -127,7 +134,6 @@ function discoverRoster(values, config) {
       ...header,
       firstDataRow: header.rowIndex + 1,
       lastDataRow: nextHeaderRow - 1,
-      originalCol: -1,
       dateStartCol,
       dateEndCol,
     };
@@ -176,12 +182,12 @@ export class HolidayService {
     const spreadsheet = await this.sheets.getSpreadsheet();
     const sheetNames = spreadsheet.sheets.map((sheet) => sheet.properties.title);
 
-    if (sheetNames.includes(preferred)) {
-      this.mainSheetName = preferred;
-      return this.mainSheetName;
+    if (!sheetNames.includes(preferred)) {
+      throw new Error(`找不到主表分頁：${preferred}`);
     }
 
-    throw new Error(`找不到主表分頁：${preferred}`);
+    this.mainSheetName = preferred;
+    return this.mainSheetName;
   }
 
   async ensureSupportSheets() {
@@ -229,7 +235,7 @@ export class HolidayService {
 
     const bindings = await this.loadBindings();
     const existing = bindings.find((binding) => binding.userId === userId);
-    const createdAt = existing ? existing.createdAt || "" : nowText(this.config.timeZone);
+    const createdAt = existing ? "" : nowText(this.config.timeZone);
     const updatedAt = nowText(this.config.timeZone);
     const row = [
       userId,
@@ -317,12 +323,52 @@ export class HolidayService {
     );
     if (sameMonthDay.length === 1) return sameMonthDay[0];
 
-    if (!dateInputHasMonth(text)) {
+    if (!/(\d)\s*(\/|-|\.|月)/.test(cleanText(text))) {
       const sameDay = dates.filter((date) => date.day === parsedDate.day);
       if (sameDay.length === 1) return sameDay[0];
     }
 
     return null;
+  }
+
+  resolveRequestedDates(text, snapshot) {
+    const normalized = normalizeInputText(text);
+    const requested = [];
+    const occupied = [];
+    const monthDayPattern = /(?:^|[^\dA-Za-z])(\d{1,2})\s*(?:\/|月)\s*(\d{1,2})((?:\s*(?:\.|\s)\s*\d{1,2})*)/g;
+    let match;
+
+    while ((match = monthDayPattern.exec(normalized))) {
+      const month = Number(match[1]);
+      const firstDay = Number(match[2]);
+      const tail = match[3] || "";
+      const days = [firstDay, ...[...tail.matchAll(/\d{1,2}/g)].map((item) => Number(item[0]))];
+
+      occupied.push([match.index, monthDayPattern.lastIndex]);
+      for (const day of days) {
+        const parsed = parseDateFromText(`${month}/${day}`, this.config.timeZone);
+        if (!parsed) continue;
+        const matchedDate = this.resolveDateColumn(parsed, `${month}/${day}`, snapshot);
+        requested.push({ input: `${month}/${day}`, parsed, matchedDate });
+      }
+    }
+
+    let rest = normalized;
+    for (const [start, end] of occupied.reverse()) {
+      rest = `${rest.slice(0, start)} ${rest.slice(end)}`;
+    }
+
+    const workerId = extractWorkerId(rest, this.config);
+    if (workerId) rest = rest.replace(workerId, " ");
+
+    for (const item of rest.matchAll(/(?:^|[^\dA-Za-z])(\d{1,2})(?=$|[^\dA-Za-z])/g)) {
+      const parsed = parseDateFromText(item[1], this.config.timeZone);
+      if (!parsed) continue;
+      const matchedDate = this.resolveDateColumn(parsed, item[1], snapshot);
+      requested.push({ input: item[1], parsed, matchedDate });
+    }
+
+    return uniqueBy(requested, (item) => item.matchedDate?.iso || item.parsed.iso);
   }
 
   formatAvailableDateRange(snapshot) {
@@ -360,35 +406,32 @@ export class HolidayService {
     return null;
   }
 
-  countForDate(snapshot, team, colIndex) {
+  countForDate(snapshot, colIndex) {
     return snapshot.roster.employees.filter((employee) => {
-      if (employee.team !== team) return false;
       const value = cleanText(snapshot.values[employee.rowIndex]?.[colIndex]);
       return value === this.config.rules.newMark;
     }).length;
   }
 
-  async writeAcceptedSelection(snapshot, employee, colIndex) {
+  async writeAcceptedSelections(snapshot, employee, colIndexes) {
     const sheetName = snapshot.sheetName;
-    await this.sheets.batchUpdateValues([
-      {
+    await this.sheets.batchUpdateValues(
+      colIndexes.map((colIndex) => ({
         range: singleCellA1(sheetName, employee.rowIndex, colIndex),
         values: [[this.config.rules.newMark]],
-      },
-    ]);
+      })),
+    );
 
     if (!this.sheets.formatCells) return;
 
     await this.sheets.formatCells(
       sheetName,
-      [
-        {
-          startRowIndex: employee.rowIndex,
-          endRowIndex: employee.rowIndex + 1,
-          startColumnIndex: colIndex,
-          endColumnIndex: colIndex + 1,
-        },
-      ],
+      colIndexes.map((colIndex) => ({
+        startRowIndex: employee.rowIndex,
+        endRowIndex: employee.rowIndex + 1,
+        startColumnIndex: colIndex,
+        endColumnIndex: colIndex + 1,
+      })),
       {
         backgroundColor: { red: 1, green: 1, blue: 0 },
         textFormat: {
@@ -405,51 +448,44 @@ export class HolidayService {
 
     if (!normalizedText) return null;
 
-    if (/^(規則|說明|help|rule|rules)$/i.test(normalizedText)) {
+    if (/^(規則|說明|help)$/i.test(normalizedText)) {
       return RULES_TEXT;
     }
 
     if (/^(群組資料|groupid|group id)$/i.test(normalizedText)) {
       const mappedTeam = this.config.rules.groupTeamMap[groupId] || "未設定";
-      return multiLang({
-        zh: `groupId：${groupId || "無群組 ID"}\n對應組別：${mappedTeam}`,
-        en: `groupId: ${groupId || "No group ID"}\nMapped team: ${mappedTeam}`,
-        vi: `groupId: ${groupId || "Không có mã nhóm"}\nNhóm tương ứng: ${mappedTeam}`,
-      });
+      return [`groupId：${groupId || "無群組 ID"}`, `對應組別：${mappedTeam}`].join("\n");
     }
 
-    const parsedDate = parseDateFromText(normalizedText, this.config.timeZone);
+    const snapshot = await this.loadMainSheet();
+    const requestedDates = this.resolveRequestedDates(normalizedText, snapshot);
     const workerIdInText = extractWorkerId(normalizedText, this.config);
     const isStatusQuery = /^(查詢|狀態|status|query)/i.test(normalizedText);
 
-    if (!parsedDate && isStatusQuery) {
-      return multiLang({
-        zh: "請輸入要查詢的日期，例如：查詢 6/3",
-        en: "Please enter the date to check, for example: status 6/3",
-        vi: "Vui lòng nhập ngày cần kiểm tra, ví dụ: kiem tra 6/3",
-      });
+    if (requestedDates.length === 0 && isStatusQuery) {
+      return "請輸入要查詢的日期，例如：查詢 6/11 或 查詢 11";
     }
 
-    if (!parsedDate) return null;
+    if (requestedDates.length === 0) return null;
 
-    const snapshot = await this.loadMainSheet();
-    const matchedDate = this.resolveDateColumn(parsedDate, normalizedText, snapshot);
-
-    if (!matchedDate) {
+    const invalidDate = requestedDates.find((item) => !item.matchedDate);
+    if (invalidDate) {
       const rangeText = this.formatAvailableDateRange(snapshot) || "目前表格日期範圍";
       await this.appendLog({
         status: "NEED_DATE",
-        dateIso: parsedDate.iso,
+        dateIso: invalidDate.parsed.iso,
         displayName,
         source,
         text,
         note: "輸入日期不在表格指定範圍內",
       });
-      return multiLang({
-        zh: `此日期不在表格指定範圍內，請依照表格日期輸入。目前可申請日期：${rangeText}`,
-        en: `This date is not in the sheet date range. Please enter a date shown in the sheet. Available dates: ${rangeText}`,
-        vi: `Ngày này không nằm trong phạm vi ngày của bảng. Vui lòng nhập ngày có trong bảng. Ngày có thể đăng ký: ${rangeText}`,
-      });
+      return `日期 ${formatDateForReply(invalidDate.parsed.iso)} 不在表格指定範圍內，請依照表格日期輸入。目前可申請日期：${rangeText}`;
+    }
+
+    if (isStatusQuery) {
+      return requestedDates
+        .map((item) => this.buildDateStatusReply(snapshot, item.matchedDate.iso, item.matchedDate.colIndex))
+        .join("\n\n");
     }
 
     let workerId = workerIdInText;
@@ -458,41 +494,30 @@ export class HolidayService {
       workerId = binding?.workerId || null;
     }
 
-    if (isStatusQuery) {
-      return this.buildDateStatusReply(snapshot, matchedDate.iso, matchedDate.colIndex);
-    }
-
     if (!workerId) {
+      const first = requestedDates[0].matchedDate;
       await this.appendLog({
         status: "NEED_WORKER_ID",
-        dateIso: matchedDate.iso,
+        dateIso: first.iso,
         displayName,
         source,
         text,
         note: "輸入日期但缺少工號",
       });
-      return multiLang({
-        zh: `請輸入工號和日期，例如：P0257 ${formatDateForReply(matchedDate.iso)}。完成第一次申請後，下次可只輸入日期。`,
-        en: `Please enter your worker ID and date, for example: P0257 ${formatDateForReply(matchedDate.iso)}. After the first request, you can enter only the date next time.`,
-        vi: `Vui lòng nhập mã nhân viên và ngày, ví dụ: P0257 ${formatDateForReply(matchedDate.iso)}. Sau lần đăng ký đầu tiên, lần sau chỉ cần nhập ngày.`,
-      });
+      return `請輸入工號和日期，例如：P0949 ${formatDateForReply(first.iso)}。完成第一次申請後，下次可只輸入日期。`;
     }
 
     const employee = this.findEmployee(snapshot, workerId);
     if (!employee) {
       await this.appendLog({
         status: "REJECTED_UNKNOWN_WORKER",
-        dateIso: matchedDate.iso,
+        dateIso: requestedDates[0].matchedDate.iso,
         displayName,
         source,
         text,
         note: `查無工號 ${workerId}`,
       });
-      return multiLang({
-        zh: `查無工號 ${workerId}，請確認工號是否正確。`,
-        en: `Worker ID ${workerId} was not found. Please check the worker ID.`,
-        vi: `Không tìm thấy mã nhân viên ${workerId}. Vui lòng kiểm tra lại mã nhân viên.`,
-      });
+      return `查無工號 ${workerId}，請確認工號是否正確。`;
     }
 
     const mappedTeam = this.config.rules.groupTeamMap[groupId];
@@ -500,17 +525,13 @@ export class HolidayService {
       await this.appendLog({
         status: "REJECTED_WRONG_GROUP",
         employee,
-        dateIso: matchedDate.iso,
+        dateIso: requestedDates[0].matchedDate.iso,
         displayName,
         source,
         text,
         note: `群組設定為 ${mappedTeam}，人員組別為 ${employee.team}`,
       });
-      return multiLang({
-        zh: `${employee.name} 屬於 ${employee.team}，此群組設定為 ${mappedTeam}，請到正確群組申請。`,
-        en: `${employee.name} belongs to ${employee.team}. This group is set to ${mappedTeam}. Please request in the correct group.`,
-        vi: `${employee.name} thuộc nhóm ${employee.team}. Nhóm này được đặt là ${mappedTeam}. Vui lòng đăng ký đúng nhóm.`,
-      });
+      return `${employee.name} 屬於 ${employee.team}，此群組設定為 ${mappedTeam}，請到正確群組申請。`;
     }
 
     const existingBinding = source?.userId ? await this.findBindingByUserId(source.userId) : null;
@@ -522,17 +543,13 @@ export class HolidayService {
       await this.appendLog({
         status: "REJECTED_UNKNOWN_WORKER",
         employee,
-        dateIso: matchedDate.iso,
+        dateIso: requestedDates[0].matchedDate.iso,
         displayName,
         source,
         text,
         note: `LINE帳號已綁定 ${existingBinding.workerId}`,
       });
-      return multiLang({
-        zh: `此 LINE 帳號已綁定工號 ${existingBinding.workerId}，如需變更請聯絡組長。`,
-        en: `This LINE account is already linked to worker ID ${existingBinding.workerId}. Please contact the leader if it needs to be changed.`,
-        vi: `Tài khoản LINE này đã liên kết với mã nhân viên ${existingBinding.workerId}. Nếu cần thay đổi, vui lòng liên hệ tổ trưởng.`,
-      });
+      return `此 LINE 帳號已綁定工號 ${existingBinding.workerId}，如需變更請聯絡組長。`;
     }
 
     const existingSelection = this.findExistingSelection(snapshot, employee);
@@ -540,99 +557,99 @@ export class HolidayService {
       await this.appendLog({
         status: "REJECTED_DUPLICATE",
         employee,
-        dateIso: matchedDate.iso,
+        dateIso: requestedDates[0].matchedDate.iso,
         displayName,
         source,
         text,
         note: `已申請 ${existingSelection.label}`,
       });
-      return multiLang({
-        zh: `${employee.name} 已申請 ${existingSelection.label}，如需變更請聯絡組長。`,
-        en: `${employee.name} has already requested ${existingSelection.label}. Please contact the leader if it needs to be changed.`,
-        vi: `${employee.name} đã đăng ký ngày ${existingSelection.label}. Nếu cần thay đổi, vui lòng liên hệ tổ trưởng.`,
-      });
+      return `${employee.name} 已申請 ${existingSelection.label}，如需變更請聯絡組長。`;
     }
 
-    const currentCellValue = cleanText(snapshot.values[employee.rowIndex]?.[matchedDate.colIndex]);
-    if (currentCellValue !== this.config.rules.eligibleShiftMark) {
-      await this.appendLog({
-        status: "NEED_DATE",
-        employee,
-        dateIso: matchedDate.iso,
-        displayName,
-        source,
-        text,
-        note: `該日期原班別不是 ${this.config.rules.eligibleShiftMark}`,
-      });
-      return multiLang({
-        zh: `${employee.name} 在 ${formatDateForReply(matchedDate.iso)} 原班別不是 ${this.config.rules.eligibleShiftMark}，不可申請該日特休。`,
-        en: `${employee.name}'s original shift on ${formatDateForReply(matchedDate.iso)} is not ${this.config.rules.eligibleShiftMark}, so this date cannot be requested.`,
-        vi: `Ca ban đầu của ${employee.name} vào ngày ${formatDateForReply(matchedDate.iso)} không phải ${this.config.rules.eligibleShiftMark}, nên không thể đăng ký ngày này.`,
-      });
+    const accepted = [];
+    const rejected = [];
+
+    for (const item of requestedDates) {
+      const { matchedDate } = item;
+      const currentCellValue = cleanText(snapshot.values[employee.rowIndex]?.[matchedDate.colIndex]);
+
+      if (currentCellValue !== this.config.rules.eligibleShiftMark) {
+        rejected.push(
+          `${formatDateForReply(matchedDate.iso)} 原班別不是 ${this.config.rules.eligibleShiftMark}`,
+        );
+        continue;
+      }
+
+      const count = this.countForDate(snapshot, matchedDate.colIndex);
+      if (count >= this.config.rules.maxPerDate) {
+        rejected.push(`${formatDateForReply(matchedDate.iso)} 名額已滿`);
+        continue;
+      }
+
+      accepted.push(matchedDate);
+      snapshot.values[employee.rowIndex][matchedDate.colIndex] = this.config.rules.newMark;
     }
 
-    const count = this.countForDate(snapshot, employee.team, matchedDate.colIndex);
-    if (count >= this.config.rules.maxPerDate) {
+    if (accepted.length === 0) {
       await this.appendLog({
         status: "REJECTED_FULL",
         employee,
-        dateIso: matchedDate.iso,
+        dateIso: requestedDates[0].matchedDate.iso,
         displayName,
         source,
         text,
-        note: `${formatDateForReply(matchedDate.iso)} 已有 ${count} 人`,
+        note: rejected.join("；"),
       });
-      return multiLang({
-        zh: `${formatDateForReply(matchedDate.iso)} 已有 ${count} 人申請，名額已滿，請改選其他日期。`,
-        en: `${formatDateForReply(matchedDate.iso)} already has ${count} people requesting special leave. The limit is full. Please choose another date.`,
-        vi: `Ngày ${formatDateForReply(matchedDate.iso)} đã có ${count} người đăng ký, đã hết chỗ. Vui lòng chọn ngày khác.`,
-      });
+      return [`${employee.name} 未完成申請。`, ...rejected].join("\n");
     }
 
-    await this.writeAcceptedSelection(snapshot, employee, matchedDate.colIndex);
+    await this.writeAcceptedSelections(
+      snapshot,
+      employee,
+      accepted.map((date) => date.colIndex),
+    );
     await this.upsertBinding({
       userId: source?.userId,
       employee,
       displayName,
       groupId,
     });
-    await this.appendLog({
-      status: "ACCEPTED",
-      employee,
-      dateIso: matchedDate.iso,
-      displayName,
-      source,
-      text,
-      note: "",
-    });
 
-    const remaining = Math.max(0, this.config.rules.maxPerDate - (count + 1));
-    return multiLang({
-      zh: `${employee.name} 已成功申請特休 ${formatDateForReply(matchedDate.iso)}。\n剩餘名額：${remaining}`,
-      en: `${employee.name} has successfully requested special leave for ${formatDateForReply(matchedDate.iso)}.\nRemaining slots: ${remaining}`,
-      vi: `${employee.name} đã đăng ký thành công ngày ${formatDateForReply(matchedDate.iso)}.\nSố chỗ còn lại: ${remaining}`,
-    });
+    for (const date of accepted) {
+      await this.appendLog({
+        status: "ACCEPTED",
+        employee,
+        dateIso: date.iso,
+        displayName,
+        source,
+        text,
+        note: rejected.length ? `部分失敗：${rejected.join("；")}` : "",
+      });
+    }
+
+    const successText = accepted.map((date) => formatDateForReply(date.iso)).join("、");
+    const lines = [`${employee.name} 已成功申請特休：${successText}`];
+    if (rejected.length) {
+      lines.push("未完成：");
+      lines.push(...rejected);
+    }
+    return lines.join("\n");
   }
 
   buildDateStatusReply(snapshot, dateIso, colIndex) {
-    const lines = [
-      multiLang({
-        zh: `${formatDateForReply(dateIso)} 特休申請狀況`,
-        en: `${formatDateForReply(dateIso)} special leave request status`,
-        vi: `Tình trạng đăng ký ngày ${formatDateForReply(dateIso)}`,
-      }),
-    ];
     const names = [];
 
     for (const employee of snapshot.roster.employees) {
       if (this.getDateIsoAtColumn(snapshot, employee.block, colIndex) !== dateIso) continue;
-
       const cell = cleanText(snapshot.values[employee.rowIndex]?.[colIndex]);
       if (cell !== this.config.rules.newMark) continue;
       names.push(`${employee.name}(${employee.workerId})`);
     }
 
-    lines.push(`台籍: ${names.length}/${this.config.rules.maxPerDate}` + (names.length ? ` - ${names.join(", ")}` : ""));
-    return lines.join("\n");
+    return (
+      `${formatDateForReply(dateIso)} 特休申請狀況\n` +
+      `台籍: ${names.length}/${this.config.rules.maxPerDate}` +
+      (names.length ? ` - ${names.join(", ")}` : "")
+    );
   }
 }
