@@ -41,7 +41,7 @@ class FakeSheetsClient {
 
   async getValues(range) {
     await delay();
-    if (range.includes("Line綁定")) return [];
+    if (range.includes("台籍Line綁定")) return [];
     return clone(this.values);
   }
 
@@ -59,6 +59,8 @@ class FakeSheetsClient {
       this.values[rowIndex][colIndex] = update.values[0][0];
     }
   }
+
+  async formatCells() {}
 }
 
 function makeConfig() {
@@ -67,7 +69,7 @@ function makeConfig() {
     sheets: {
       mainSheetName: "台籍特休",
       logSheetName: "台籍特休回覆紀錄",
-      bindingSheetName: "Line綁定",
+      bindingSheetName: "台籍Line綁定",
     },
     rules: {
       maxPerDate: 3,
@@ -84,16 +86,15 @@ function makeConfig() {
 
 function makeSheetValues() {
   const values = [
-    ["", "", "", "預排特休日期", "", "", "", "", "", ""],
-    ["工號", "姓名", "組別\n日期", "A", "A", "B", "B", "A", "A", "B"],
-    ["", "", "", "6/7", "6/8", "6/9", "6/10", "6/11", "6/12", "6/13"],
+    ["", "", "", "B班", "B班", "A班", "A班", "B班", "B班", "A班"],
+    ["", "工號", "姓名", "6/7", "6/8", "6/9", "6/10", "6/11", "6/12", "6/13"],
   ];
 
   for (let i = 1; i <= 50; i += 1) {
     values.push([
-      `TA${String(i).padStart(3, "0")}`,
+      "",
+      `P${String(i).padStart(4, "0")}`,
       `台籍人員${i}`,
-      "TW_A",
       "N1",
       "N1",
       "N1",
@@ -113,7 +114,7 @@ test("serializes concurrent special leave requests so max per date is not exceed
 
   const messages = Array.from({ length: 50 }, (_, index) =>
     service.handleTextMessage({
-      text: `TA${String(index + 1).padStart(3, "0")} 8`,
+      text: `P${String(index + 1).padStart(4, "0")} 8`,
       source: { type: "group", groupId: "G1" },
       displayName: `user-${index + 1}`,
     }),
@@ -123,10 +124,25 @@ test("serializes concurrent special leave requests so max per date is not exceed
   const accepted = replies.filter((reply) => reply.includes("已成功申請特休")).length;
   const full = replies.filter((reply) => reply.includes("名額已滿")).length;
   const selectedCount = sheets.values
-    .slice(3, 53)
+    .slice(2, 52)
     .filter((row) => String(row[4] || "") === "特休").length;
 
   assert.equal(accepted, 3);
   assert.equal(full, 47);
   assert.equal(selectedCount, 3);
+});
+
+test("supports requesting multiple dates in one message", async () => {
+  const sheets = new FakeSheetsClient(makeSheetValues());
+  const service = new HolidayService({ sheetsClient: sheets, config: makeConfig() });
+
+  const reply = await service.handleTextMessage({
+    text: "P0001 6/11.12",
+    source: { type: "group", groupId: "G1" },
+    displayName: "user-1",
+  });
+
+  assert.match(reply, /6\/11、6\/12/);
+  assert.equal(sheets.values[2][7], "特休");
+  assert.equal(sheets.values[2][8], "特休");
 });
