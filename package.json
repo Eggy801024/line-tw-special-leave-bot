@@ -1,0 +1,14 @@
+{
+  "name": "line-tw-special-leave-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LINE bot for Taiwan staff special leave pre-registration and Google Sheets sync.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --test"
+  }
+}
